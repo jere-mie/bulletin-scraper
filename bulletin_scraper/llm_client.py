@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -18,14 +19,17 @@ class OpenRouterLlmClient:
         settings = get_settings()
         self.model = model
         self.api_key = api_key or settings.openrouter_api_key
+        self.enable_prompt_caching = settings.enable_prompt_caching
+        self.prompt_cache_ttl = settings.prompt_cache_ttl
         if not self.api_key:
             raise RuntimeError(
                 "OPENROUTER_API_KEY is not set. Configure it in the environment or .env before running workflows."
             )
         self._client = None
+        self._artifact_content_cache: dict[str, list[dict[str, Any]]] = {}
 
     def invoke_json(self, prompt: str, artifact: InputArtifact, stage_name: str) -> tuple[dict[str, Any], str]:
-        from langchain_core.messages import HumanMessage
+        from langchain_core.messages import HumanMessage, SystemMessage
         from langchain_core.output_parsers import JsonOutputParser
         from langchain_core.runnables import RunnableLambda
 
@@ -35,7 +39,13 @@ class OpenRouterLlmClient:
         chain = (
             RunnableLambda(
                 lambda params: [
-                    HumanMessage(content=self._build_content(params["prompt"], params["artifact"]))
+                    SystemMessage(
+                        content=(
+                            "You extract structured Catholic bulletin data. "
+                            "Return only valid JSON that matches the requested schema."
+                        )
+                    ),
+                    HumanMessage(content=self._build_content(params["prompt"], params["artifact"])),
                 ]
             )
             | client
@@ -67,17 +77,31 @@ class OpenRouterLlmClient:
         return self._client
 
     def _build_content(self, prompt: str, artifact: InputArtifact):
-        if artifact.mode is InputMode.TEXT:
-            return (
-                f"{prompt}\n\nBULLETIN TEXT\n"
-                f"-------------\n{artifact.payload}\n\n"
-                "Return only JSON."
-            )
+        content = [{"type": "text", "text": "Use the bulletin source below as the primary reference."}]
+        content.extend(self._get_artifact_content_blocks(artifact))
+        content.append({"type": "text", "text": prompt})
+        return content
 
-        content = [{"type": "text", "text": prompt}]
-        if artifact.mode is InputMode.IMAGES:
-            for image_path in artifact.payload:
-                content.append(
+    def _get_artifact_content_blocks(self, artifact: InputArtifact) -> list[dict[str, Any]]:
+        cache_key = artifact.cache_key()
+        cached = self._artifact_content_cache.get(cache_key)
+        if cached is not None:
+            return deepcopy(cached)
+
+        blocks: list[dict[str, Any]] = []
+        if artifact.mode is InputMode.TEXT:
+            blocks = [
+                {"type": "text", "text": "BULLETIN TEXT\n-------------"},
+                self._maybe_add_cache_control({"type": "text", "text": artifact.payload}),
+            ]
+        elif artifact.mode is InputMode.TEXT_IMAGES:
+            blocks = [
+                {"type": "text", "text": "BULLETIN TEXT\n-------------"},
+                self._maybe_add_cache_control({"type": "text", "text": artifact.payload.get("text", "")}),
+                {"type": "text", "text": "BULLETIN PAGE IMAGES\n-------------------"},
+            ]
+            for image_path in artifact.payload.get("images", []):
+                blocks.append(
                     {
                         "type": "image_url",
                         "image_url": {
@@ -86,18 +110,46 @@ class OpenRouterLlmClient:
                         },
                     }
                 )
-            return content
+        elif artifact.mode is InputMode.IMAGES:
+            blocks = [{"type": "text", "text": "BULLETIN PAGE IMAGES\n-------------------"}]
+            for image_path in artifact.payload:
+                blocks.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": _path_to_image_data_url(image_path),
+                            "detail": "high",
+                        },
+                    }
+                )
+        else:
+            blocks = [
+                {
+                    "type": "file",
+                    "file": {
+                        "filename": Path(artifact.payload).name,
+                        "file_data": _path_to_pdf_data_url(Path(artifact.payload)),
+                    },
+                }
+            ]
 
-        content.append(
-            {
-                "type": "file",
-                "file": {
-                    "filename": Path(artifact.payload).name,
-                    "file_data": _path_to_pdf_data_url(Path(artifact.payload)),
-                },
-            }
-        )
-        return content
+        self._artifact_content_cache[cache_key] = deepcopy(blocks)
+        return deepcopy(blocks)
+
+    def _maybe_add_cache_control(self, block: dict[str, Any]) -> dict[str, Any]:
+        if not self.enable_prompt_caching:
+            return block
+        if block.get("type") != "text":
+            return block
+        text = str(block.get("text") or "")
+        if len(text) < 1500:
+            return block
+        cache_control: dict[str, str] = {"type": "ephemeral"}
+        if self.prompt_cache_ttl == "1h":
+            cache_control["ttl"] = "1h"
+        enriched = dict(block)
+        enriched["cache_control"] = cache_control
+        return enriched
 
 
 def _flatten_response_content(content) -> str:

@@ -1,3 +1,5 @@
+strategy-sweep-findings*
+tmp/
 bulletins*.txt
 bulletins/
 runs/

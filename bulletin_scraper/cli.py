@@ -17,7 +17,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--interactive",
         action="store_true",
-        help="Prompt for run settings in the terminal. If omitted, interactive mode is auto-enabled when no arguments are provided in a TTY.",
+        help="Prompt only for settings that were not already supplied by CLI flags or environment variables.",
     )
     parser.add_argument(
         "--mode",
@@ -38,7 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--input-modes",
         default=settings.default_input_modes,
-        help="Comma-separated bulletin inputs: images,text,pdf",
+        help="Comma-separated bulletin inputs: images,text,text-images,pdf",
     )
     parser.add_argument(
         "--apply",
@@ -131,12 +131,14 @@ def build_parser() -> argparse.ArgumentParser:
 def parse_args(argv: list[str] | None = None) -> tuple[RunConfig, AppPaths]:
     parser = build_parser()
     args = parser.parse_args(argv)
-    if _should_prompt_interactively(argv, args.interactive):
-        args = _prompt_for_run_settings(args)
+    cli_options = _collect_cli_options(argv)
+    settings = get_settings()
+    if _should_prompt_interactively(args.interactive):
+        args = _prompt_for_run_settings(args, cli_options, settings.model_fields_set)
 
     root = Path(__file__).resolve().parent.parent
     targets_value = args.targets
-    if targets_value == get_settings().default_targets and args.mode != "mass":
+    if targets_value == settings.default_targets and args.mode != "mass":
         targets_value = {
             "mass": "schedule",
             "events": "events",
@@ -145,8 +147,10 @@ def parse_args(argv: list[str] | None = None) -> tuple[RunConfig, AppPaths]:
 
     input_modes_value = args.input_modes
     if args.no_images:
-        resolved_input_modes = [mode for mode in _split_csv(input_modes_value) if mode != "images"]
-        input_modes_value = ",".join(resolved_input_modes or ["text", "pdf"])
+        resolved_input_modes = [
+            mode for mode in _split_csv(input_modes_value) if mode not in {"images", "text-images"}
+        ]
+        input_modes_value = ",".join(resolved_input_modes or ["text"])
 
     churches_path = root / args.churches_path
     events_path = root / args.events_path
@@ -182,41 +186,109 @@ def _split_csv(value: str) -> list[str]:
     return [part.strip() for part in value.split(",") if part.strip()]
 
 
-def _should_prompt_interactively(argv: list[str] | None, interactive_flag: bool) -> bool:
-    if interactive_flag:
-        return True
-    return (not argv) and sys.stdin.isatty() and sys.stdout.isatty()
+def _should_prompt_interactively(interactive_flag: bool) -> bool:
+    return interactive_flag
 
 
-def _prompt_for_run_settings(args: argparse.Namespace) -> argparse.Namespace:
+def _collect_cli_options(argv: list[str] | None) -> set[str]:
+    if not argv:
+        return set()
+    options: set[str] = set()
+    for token in argv:
+        if not token.startswith("--"):
+            continue
+        option = token.split("=", 1)[0]
+        options.add(option)
+    return options
+
+
+def _should_prompt_field(field_name: str, cli_options: set[str], env_fields: set[str]) -> bool:
+    env_field_map = {
+        "targets": "default_targets",
+        "strategies": "default_strategies",
+        "input_modes": "default_input_modes",
+        "workers": "workers",
+        "family_limit": "family_limit",
+        "family_filter": "family_filter",
+        "use_existing_bulletins": "use_existing_bulletins",
+        "refresh_bulletins": "refresh_bulletins",
+        "model": "model",
+        "log_level": "log_level",
+        "churches_path": "churches_path",
+        "events_path": "events_path",
+        "intentions_path": "intentions_path",
+        "bulletins_dir": "bulletins_dir",
+        "bulletin_cache_path": "bulletin_cache_path",
+        "runs_dir": "runs_dir",
+    }
+    cli_option_map = {
+        "targets": {"--targets", "--mode"},
+        "strategies": {"--strategies"},
+        "input_modes": {"--input-modes", "--no-images"},
+        "family_filter": {"--family-filter"},
+        "family_limit": {"--family-limit"},
+        "workers": {"--workers"},
+        "apply": {"--apply", "--modify-json"},
+        "use_existing_bulletins": {"--use-existing-bulletins", "--no-use-existing-bulletins"},
+        "refresh_bulletins": {"--refresh-bulletins", "--no-refresh-bulletins"},
+        "model": {"--model"},
+        "log_level": {"--log-level"},
+        "churches_path": {"--churches-path"},
+        "events_path": {"--events-path"},
+        "intentions_path": {"--intentions-path"},
+        "bulletins_dir": {"--bulletins-dir"},
+        "bulletin_cache_path": {"--bulletin-cache-path"},
+        "runs_dir": {"--runs-dir"},
+    }
+    if cli_option_map.get(field_name, set()) & cli_options:
+        return False
+    env_field_name = env_field_map.get(field_name)
+    if env_field_name and env_field_name in env_fields:
+        return False
+    return True
+
+
+def _prompt_for_run_settings(
+    args: argparse.Namespace,
+    cli_options: set[str],
+    env_fields: set[str],
+) -> argparse.Namespace:
     args.interactive = True
-    args.targets = _prompt_text(
-        "Targets [schedule,events,intentions,combined]",
-        args.targets,
-    )
-    args.strategies = _prompt_text(
-        "Strategies [direct,extract-merge,reviewed]",
-        args.strategies,
-    )
-    args.input_modes = _prompt_text(
-        "Input modes [images,text,pdf]",
-        args.input_modes,
-    )
-    args.family_filter = _prompt_text("Family filter (blank for all)", args.family_filter or "") or None
-    args.family_limit = _prompt_optional_int("Family limit (blank for all)", args.family_limit)
-    args.workers = _prompt_int("Workers", args.workers)
-    args.apply = _prompt_bool("Apply selected results", args.apply or args.modify_json)
-    args.modify_json = args.apply
-    args.use_existing_bulletins = _prompt_bool("Force reuse of local bulletin PDFs", args.use_existing_bulletins)
-    args.refresh_bulletins = _prompt_bool("Refresh bulletin cache this run", args.refresh_bulletins)
-    args.model = _prompt_text("Model", args.model)
-    args.log_level = _prompt_text("Log level [DEBUG,INFO,WARNING,ERROR]", args.log_level).upper()
-    args.churches_path = _prompt_text("Churches JSON path", args.churches_path)
-    args.events_path = _prompt_text("Events JSON path", args.events_path)
-    args.intentions_path = _prompt_text("Intentions JSON path", args.intentions_path)
-    args.bulletins_dir = _prompt_text("Bulletins directory", args.bulletins_dir)
-    args.bulletin_cache_path = _prompt_text("Bulletin cache JSON path", args.bulletin_cache_path)
-    args.runs_dir = _prompt_text("Runs directory", args.runs_dir)
+    if _should_prompt_field("targets", cli_options, env_fields):
+        args.targets = _prompt_text("Targets [schedule,events,intentions,combined]", args.targets)
+    if _should_prompt_field("strategies", cli_options, env_fields):
+        args.strategies = _prompt_text("Strategies [direct,extract-merge,reviewed]", args.strategies)
+    if _should_prompt_field("input_modes", cli_options, env_fields):
+        args.input_modes = _prompt_text("Input modes [images,text,text-images,pdf]", args.input_modes)
+    if _should_prompt_field("family_filter", cli_options, env_fields):
+        args.family_filter = _prompt_text("Family filter (blank for all)", args.family_filter or "") or None
+    if _should_prompt_field("family_limit", cli_options, env_fields):
+        args.family_limit = _prompt_optional_int("Family limit (blank for all)", args.family_limit)
+    if _should_prompt_field("workers", cli_options, env_fields):
+        args.workers = _prompt_int("Workers", args.workers)
+    if _should_prompt_field("apply", cli_options, env_fields):
+        args.apply = _prompt_bool("Apply selected results", args.apply or args.modify_json)
+        args.modify_json = args.apply
+    if _should_prompt_field("use_existing_bulletins", cli_options, env_fields):
+        args.use_existing_bulletins = _prompt_bool("Force reuse of local bulletin PDFs", args.use_existing_bulletins)
+    if _should_prompt_field("refresh_bulletins", cli_options, env_fields):
+        args.refresh_bulletins = _prompt_bool("Refresh bulletin cache this run", args.refresh_bulletins)
+    if _should_prompt_field("model", cli_options, env_fields):
+        args.model = _prompt_text("Model", args.model)
+    if _should_prompt_field("log_level", cli_options, env_fields):
+        args.log_level = _prompt_text("Log level [DEBUG,INFO,WARNING,ERROR]", args.log_level).upper()
+    if _should_prompt_field("churches_path", cli_options, env_fields):
+        args.churches_path = _prompt_text("Churches JSON path", args.churches_path)
+    if _should_prompt_field("events_path", cli_options, env_fields):
+        args.events_path = _prompt_text("Events JSON path", args.events_path)
+    if _should_prompt_field("intentions_path", cli_options, env_fields):
+        args.intentions_path = _prompt_text("Intentions JSON path", args.intentions_path)
+    if _should_prompt_field("bulletins_dir", cli_options, env_fields):
+        args.bulletins_dir = _prompt_text("Bulletins directory", args.bulletins_dir)
+    if _should_prompt_field("bulletin_cache_path", cli_options, env_fields):
+        args.bulletin_cache_path = _prompt_text("Bulletin cache JSON path", args.bulletin_cache_path)
+    if _should_prompt_field("runs_dir", cli_options, env_fields):
+        args.runs_dir = _prompt_text("Runs directory", args.runs_dir)
     return args
 
 

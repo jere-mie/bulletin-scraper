@@ -6,6 +6,7 @@ import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 from . import scraping
 from .config import AppPaths, RunConfig
@@ -108,10 +109,13 @@ def ensure_family_documents(
             entry.last_scraped_at = entry.last_downloaded_at
 
         if _should_reuse_cached_pdf(entry, pdf_path, config, today):
+            bulletin_date = entry.bulletin_date or _resolve_bulletin_date(entry.pdf_url, pdf_path)
+            entry.bulletin_date = bulletin_date
             family.document = BulletinDocument(
                 website=family.bulletin_website,
                 pdf_link=entry.pdf_url,
                 pdf_path=pdf_path,
+                bulletin_date=bulletin_date,
             )
             entry.status = "cached"
             entry.error = None
@@ -131,11 +135,14 @@ def ensure_family_documents(
             continue
 
         if scraping.download_pdf(pdf_link, str(pdf_path)):
+            bulletin_date = _resolve_bulletin_date(pdf_link, pdf_path)
             family.document = BulletinDocument(
                 website=family.bulletin_website,
                 pdf_link=pdf_link,
                 pdf_path=pdf_path,
+                bulletin_date=bulletin_date,
             )
+            entry.bulletin_date = bulletin_date
             entry.status = "downloaded"
             entry.error = None
             entry.last_downloaded_at = now
@@ -180,6 +187,20 @@ def build_input_artifact(
 
     text, page_count = extract_text_from_pdf(pdf_path, max_pages=max_pages)
     preview = text[:1000] if text else None
+    if input_mode is InputMode.TEXT_IMAGES:
+        image_dir = artifacts_dir / family.family_id / "text-images"
+        image_paths = convert_pdf_to_images(str(pdf_path), output_dir=str(image_dir), max_pages=max_pages)
+        return InputArtifact(
+            mode=input_mode,
+            payload={
+                "text": text,
+                "images": [Path(path) for path in image_paths],
+            },
+            description=f"{len(image_paths)} page image(s) plus extracted text",
+            page_count=max(page_count, len(image_paths)),
+            text_preview=preview,
+        )
+
     return InputArtifact(
         mode=input_mode,
         payload=text,
@@ -270,3 +291,42 @@ def _primary_website(family: BulletinFamily) -> str | None:
 
 def _timestamp_from_mtime(path: Path) -> str:
     return datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds")
+
+
+def _resolve_bulletin_date(pdf_link: str | None, pdf_path: Path) -> str | None:
+    for candidate in (_candidate_name_from_link(pdf_link), pdf_path.name):
+        if not candidate:
+            continue
+        resolved = _extract_date_from_text(candidate)
+        if resolved:
+            return resolved
+    return None
+
+
+def _candidate_name_from_link(pdf_link: str | None) -> str | None:
+    if not pdf_link:
+        return None
+    parsed = urlparse(pdf_link)
+    return unquote(Path(parsed.path).name)
+
+
+def _extract_date_from_text(text: str) -> str | None:
+    compact_match = re.search(r"(?<!\d)(20\d{2})(\d{2})(\d{2})(?!\d)", text)
+    if compact_match:
+        year, month, day = compact_match.groups()
+        return f"{year}-{month}-{day}"
+
+    month_match = re.search(
+        r"(?P<month>[A-Za-z]+)[ _-]+(?P<day>\d{1,2})(?:st|nd|rd|th)?(?:,)?[ _-]+(?P<year>20\d{2})",
+        text,
+    )
+    if month_match:
+        month = month_match.group("month")
+        day = month_match.group("day")
+        year = month_match.group("year")
+        for fmt in ("%B %d %Y", "%b %d %Y"):
+            try:
+                return datetime.strptime(f"{month} {day} {year}", fmt).date().isoformat()
+            except ValueError:
+                continue
+    return None

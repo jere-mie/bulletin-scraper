@@ -230,6 +230,7 @@ class BulletinCacheEntry(StrictModel):
     primary_website: str | None = None
     pdf_url: str | None = None
     pdf_path: Path
+    bulletin_date: str | None = None
     status: Literal["missing", "cached", "downloaded", "scrape_failed", "download_failed"] = "missing"
     error: str | None = None
     last_attempted_at: str | None = None

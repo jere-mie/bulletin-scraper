@@ -25,6 +25,7 @@ class StrategyKind(StrEnum):
 class InputMode(StrEnum):
     IMAGES = "images"
     TEXT = "text"
+    TEXT_IMAGES = "text-images"
     PDF = "pdf"
 
 
@@ -32,6 +33,7 @@ class BulletinDocument(StrictModel):
     website: str
     pdf_link: str | None
     pdf_path: Path
+    bulletin_date: str | None = None
 
 
 class BulletinFamily(StrictModel):
@@ -56,6 +58,16 @@ class InputArtifact(StrictModel):
     description: str
     page_count: int | None = None
     text_preview: str | None = None
+
+    def cache_key(self) -> str:
+        if self.mode is InputMode.TEXT:
+            return f"text:{hash(self.payload)}"
+        if self.mode is InputMode.TEXT_IMAGES:
+            image_keys = ",".join(str(path) for path in self.payload.get("images", []))
+            return f"text-images:{hash(self.payload.get('text', ''))}:{image_keys}"
+        if self.mode is InputMode.IMAGES:
+            return "images:" + ",".join(str(path) for path in self.payload)
+        return f"pdf:{self.payload}"
 
 
 class WorkflowCase(StrictModel):

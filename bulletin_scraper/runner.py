@@ -141,11 +141,15 @@ def _select_results(results_by_family: dict[str, list[WorkflowResult]]) -> dict[
             valid = [candidate for candidate in candidates if candidate.status == "ok"]
             if not valid:
                 continue
+            non_pdf_valid = [candidate for candidate in valid if candidate.case.input_mode is not InputMode.PDF]
+            if non_pdf_valid:
+                valid = non_pdf_valid
+            adapter = build_adapter(TargetKind(target_name))
             best = max(
                 valid,
                 key=lambda candidate: (
                     _payload_size_for_target(target_name, candidate.output or {}) > 0,
-                    _payload_size_for_target(target_name, candidate.output or {}),
+                    adapter.selection_key(candidate.case, candidate.output or {}),
                     candidate.score,
                 ),
             )
@@ -252,6 +256,7 @@ def _score_case(case: WorkflowCase) -> int:
         StrategyKind.DIRECT: 100,
     }[case.strategy]
     input_score = {
+        InputMode.TEXT_IMAGES: 40,
         InputMode.IMAGES: 30,
         InputMode.TEXT: 20,
         InputMode.PDF: 10,

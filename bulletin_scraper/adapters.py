@@ -8,7 +8,7 @@ from typing import Any
 from . import events as events_utils
 from . import intentions as intentions_utils
 from .json_utils import pretty_json
-from .models import BulletinFamily, TargetKind
+from .models import BulletinFamily, InputMode, TargetKind, WorkflowCase
 from .schemas import CombinedPayload, EventsPayload, IntentionsPayload, ScheduleExtractionPayload, SchedulePayload
 
 
@@ -57,6 +57,9 @@ class TargetAdapter(ABC):
     def payload_size(self, payload: dict[str, Any]) -> int:
         return 0
 
+    def selection_key(self, case: WorkflowCase, payload: dict[str, Any]) -> tuple[Any, ...]:
+        return (self.payload_size(payload), _default_input_rank(case.input_mode))
+
 
 class ScheduleAdapter(TargetAdapter):
     kind = TargetKind.SCHEDULE
@@ -78,10 +81,14 @@ class ScheduleAdapter(TargetAdapter):
         }
 
     def coerce_final_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return SchedulePayload.model_validate(payload).model_dump(mode="json", by_alias=True)
+        return SchedulePayload.model_validate(self._normalize_schedule_payload(payload)).model_dump(
+            mode="json", by_alias=True
+        )
 
     def coerce_extracted_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return ScheduleExtractionPayload.model_validate(payload).model_dump(mode="json", by_alias=True)
+        return ScheduleExtractionPayload.model_validate(self._normalize_schedule_payload(payload)).model_dump(
+            mode="json", by_alias=True
+        )
 
     def build_direct_prompt(self, family: BulletinFamily, scope: dict[str, Any]) -> str:
         return f"""You are reviewing the regular weekly schedule for a Catholic family of parishes.
@@ -256,13 +263,46 @@ Return only JSON with the same schema as the proposal."""
     def payload_size(self, payload: dict[str, Any]) -> int:
         return len(payload.get("church_updates", []))
 
+    def selection_key(self, case: WorkflowCase, payload: dict[str, Any]) -> tuple[Any, ...]:
+        changed_fields = 0
+        for update in payload.get("church_updates", []):
+            changed_fields += sum(
+                1
+                for field_name in ("masses", "daily_masses", "confession", "adoration")
+                if update.get(field_name) is not None
+            )
+        return (
+            changed_fields > 0,
+            changed_fields,
+            len(payload.get("church_updates", [])),
+            _schedule_input_rank(case.input_mode),
+        )
+
+    def _normalize_schedule_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        normalized = dict(payload)
+        if "church_updates" in normalized:
+            normalized["church_updates"] = [self._normalize_schedule_entry(entry) for entry in normalized["church_updates"]]
+        if "church_schedules" in normalized:
+            normalized["church_schedules"] = [
+                self._normalize_schedule_entry(entry) for entry in normalized["church_schedules"]
+            ]
+        return normalized
+
+    def _normalize_schedule_entry(self, entry: dict[str, Any]) -> dict[str, Any]:
+        normalized = dict(entry)
+        if not normalized.get("church_id") and normalized.get("id"):
+            normalized["church_id"] = normalized.pop("id")
+        return normalized
+
 
 class EventsAdapter(TargetAdapter):
     kind = TargetKind.EVENTS
     max_pages = 8
 
     def get_scope(self, bundle: dict[str, Any], family: BulletinFamily) -> dict[str, Any]:
+        bulletin_date = family.document.bulletin_date if family.document else None
         family_events = events_utils.filter_events_for_family(bundle["events"], family.name)
+        family_events = events_utils.prune_stale_events(family_events, bulletin_date)
         return {
             "churches": [
                 {
@@ -272,6 +312,7 @@ class EventsAdapter(TargetAdapter):
                 }
                 for church in family.churches
             ],
+            "bulletin_date": bulletin_date,
             "existing_events": family_events,
         }
 
@@ -290,8 +331,15 @@ EXISTING FAMILY EVENTS:
 TASK:
 - Extract only one-time or limited-time special events.
 - Exclude regular weekly schedules for Mass, confession, and adoration.
+- Exclude liturgies or notices that are not real special events unless they are clearly presented as a special public event.
+- Exclude one-off liturgical notices such as Holy Hours, healing Masses, memorial Masses, nursing home Masses, First Communion/Initiation Masses, and similar worship notices unless they are explicitly framed as broader public events.
+- Exclude any event that happened more than 7 days before the bulletin date.
+- Merge repeated mentions of the same event into one record.
 - Reuse an existing event id when the event clearly matches an existing event.
 - Return only JSON.
+
+BULLETIN DATE:
+{scope['bulletin_date']}
 
 OUTPUT JSON:
 {{
@@ -326,6 +374,9 @@ EXTRACTED EVENTS:
 
 TASK:
 - Keep only valid upcoming special events.
+- Drop events that happened more than 7 days before the bulletin date.
+- Merge duplicate mentions of the same event into a single record.
+- Remove liturgical notices that are not real community events.
 - Reuse an existing id for matching events.
 - Return the final events payload only.
 
@@ -339,6 +390,8 @@ PROPOSED EVENTS:
 
 TASK:
 - Remove false positives.
+- Remove duplicates or near-duplicates.
+- Remove one-off liturgical notices that are not true events.
 - Fix church assignment, dates, or times only when clearly necessary.
 - Preserve ids for matching existing events.
 
@@ -347,18 +400,34 @@ Return only JSON with an events array."""
     def apply(self, bundle: dict[str, Any], family: BulletinFamily, payload: dict[str, Any]) -> dict[str, Any]:
         stamped_events = []
         bulletin_link = family.document.pdf_link if family.document else None
-        bulletin_date = datetime.now().strftime("%Y-%m-%d")
+        bulletin_date = family.document.bulletin_date if family.document else None
         for event in payload.get("events", []):
             event_copy = deepcopy(event)
             event_copy.setdefault("family_of_parishes", family.name)
             events_utils.add_event_metadata(event_copy, bulletin_link, bulletin_date)
             stamped_events.append(event_copy)
-        merged = events_utils.merge_events(bundle["events"], stamped_events)
+        stamped_events = events_utils.prune_stale_events(events_utils.dedupe_events(stamped_events), bulletin_date)
+        merged = events_utils.prune_stale_events(events_utils.merge_events(bundle["events"], stamped_events), bulletin_date)
         bundle["events"] = merged
         return {
             "events_extracted": len(stamped_events),
             "total_events": len(merged),
         }
+
+    def postprocess_output(self, scope: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+        bulletin_date = scope.get("bulletin_date")
+        events = []
+        for event in payload.get("events", []):
+            event_copy = deepcopy(event)
+            if bulletin_date and not event_copy.get("source_bulletin_date"):
+                event_copy["source_bulletin_date"] = bulletin_date
+            events.append(event_copy)
+        events = events_utils.dedupe_events(events)
+        events = events_utils.filter_event_candidates(events)
+        events = events_utils.prune_stale_events(events, bulletin_date)
+        for event in events:
+            event.pop("source_bulletin_date", None)
+        return {"events": events}
 
     def summarize(self, payload: dict[str, Any], apply_details: dict[str, Any]) -> str:
         return (
@@ -368,6 +437,20 @@ Return only JSON with an events array."""
 
     def payload_size(self, payload: dict[str, Any]) -> int:
         return len(payload.get("events", []))
+
+    def selection_key(self, case: WorkflowCase, payload: dict[str, Any]) -> tuple[Any, ...]:
+        events = payload.get("events", [])
+        duplicate_penalty = events_utils.duplicate_event_count(events)
+        liturgy_penalty = sum(1 for event in events if events_utils._is_non_event_notice(event))
+        dated_count = sum(1 for event in events if event.get("date"))
+        quality = len(events) - (liturgy_penalty * 3) - (duplicate_penalty * 3)
+        return (
+            quality > 0,
+            quality,
+            dated_count,
+            -duplicate_penalty,
+            _events_input_rank(case.input_mode),
+        )
 
 
 class IntentionsAdapter(TargetAdapter):
@@ -385,9 +468,7 @@ class IntentionsAdapter(TargetAdapter):
                 }
                 for church in family.churches
             ],
-            "existing_intentions": [
-                entry for entry in bundle["intentions"] if entry.get("church_id") in family.church_ids
-            ],
+            "bulletin_date": family.document.bulletin_date if family.document else None,
         }
 
     def coerce_final_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -402,7 +483,16 @@ CHURCHES:
 TASK:
 - Extract every Mass intention listed for the churches in this bulletin.
 - Match each intention set to the correct church and Mass time.
+- Treat the bulletin as the source of truth for the current week; do not try to merge old weeks into the result.
+- Preserve each `for` / `by` pair from the bulletin line.
+- Never turn a requester or donor name into its own separate intention line.
+- Never shift a donor/requester name from one intention line onto the next line.
+- Do not treat celebrant names, headings, or school Mass labels as donor names.
+- If the requester is unclear, keep the intention text in `for` and set `by` to null instead of guessing.
 - Return only JSON.
+
+BULLETIN DATE:
+{scope['bulletin_date']}
 
 OUTPUT JSON:
 {{
@@ -425,10 +515,7 @@ OUTPUT JSON:
         return self.build_direct_prompt(family, scope)
 
     def build_merge_prompt(self, family: BulletinFamily, scope: dict[str, Any], extracted: dict[str, Any]) -> str:
-        return f"""You are reviewing extracted Mass intentions before they are merged.
-
-EXISTING INTENTIONS:
-{pretty_json(scope['existing_intentions'])}
+        return f"""You are reviewing extracted Mass intentions for the current bulletin week.
 
 EXTRACTED INTENTIONS:
 {pretty_json(extracted)}
@@ -436,6 +523,9 @@ EXTRACTED INTENTIONS:
 TASK:
 - Keep valid intention entries.
 - Correct church/date/time alignment when supported.
+- Preserve `for` / `by` pairings from each bulletin line.
+- If the layout is ambiguous, prefer `by: null` over shifting a donor name from a neighboring line.
+- Do not merge in older intentions from previous weeks.
 - Return only JSON with the final intentions array."""
 
     def build_review_prompt(self, family: BulletinFamily, scope: dict[str, Any], proposal: dict[str, Any]) -> str:
@@ -447,7 +537,13 @@ PROPOSED INTENTIONS:
 TASK:
 - Remove false positives.
 - Correct assignments only if the bulletin supports the correction.
+- Reject outputs that split requester names into standalone intention subjects.
+- Reject outputs where donor names were shifted onto the next intention line.
+- Prefer fewer high-confidence lines over speculative extra lines.
 - Return only JSON with the final intentions array."""
+
+    def postprocess_output(self, scope: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+        return {"intentions": intentions_utils.normalize_intentions(payload.get("intentions", []))}
 
     def apply(self, bundle: dict[str, Any], family: BulletinFamily, payload: dict[str, Any]) -> dict[str, Any]:
         stamped = []
@@ -456,7 +552,7 @@ TASK:
             entry_copy = deepcopy(entry)
             intentions_utils.add_intention_metadata(entry_copy, bulletin_link)
             stamped.append(entry_copy)
-        merged = intentions_utils.merge_intentions(bundle["intentions"], stamped)
+        merged = intentions_utils.replace_family_intentions(bundle["intentions"], family.church_ids, stamped)
         bundle["intentions"] = merged
         return {
             "intentions_extracted": len(stamped),
@@ -471,6 +567,20 @@ TASK:
 
     def payload_size(self, payload: dict[str, Any]) -> int:
         return len(payload.get("intentions", []))
+
+    def selection_key(self, case: WorkflowCase, payload: dict[str, Any]) -> tuple[Any, ...]:
+        masses, total_lines, with_by, suspicious_by = intentions_utils.intention_quality(payload.get("intentions", []))
+        trusted_by = with_by - (suspicious_by * 2)
+        return (
+            masses > 0,
+            trusted_by > 0,
+            trusted_by,
+            -suspicious_by,
+            with_by,
+            masses,
+            -total_lines,
+            _intentions_input_rank(case.input_mode),
+        )
 
 
 class CombinedAdapter(TargetAdapter):
@@ -571,3 +681,39 @@ def build_adapter(target: TargetKind) -> TargetAdapter:
     if target is TargetKind.COMBINED:
         return CombinedAdapter()
     raise ValueError(f"Unsupported target: {target}")
+
+
+def _default_input_rank(input_mode: InputMode) -> int:
+    return {
+        InputMode.TEXT_IMAGES: 3,
+        InputMode.IMAGES: 2,
+        InputMode.TEXT: 1,
+        InputMode.PDF: 0,
+    }[input_mode]
+
+
+def _schedule_input_rank(input_mode: InputMode) -> int:
+    return {
+        InputMode.TEXT_IMAGES: 3,
+        InputMode.IMAGES: 2,
+        InputMode.TEXT: 1,
+        InputMode.PDF: 0,
+    }[input_mode]
+
+
+def _events_input_rank(input_mode: InputMode) -> int:
+    return {
+        InputMode.TEXT: 3,
+        InputMode.TEXT_IMAGES: 2,
+        InputMode.IMAGES: 1,
+        InputMode.PDF: 0,
+    }[input_mode]
+
+
+def _intentions_input_rank(input_mode: InputMode) -> int:
+    return {
+        InputMode.IMAGES: 3,
+        InputMode.TEXT_IMAGES: 2,
+        InputMode.TEXT: 1,
+        InputMode.PDF: 0,
+    }[input_mode]

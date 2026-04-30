@@ -23,7 +23,7 @@ class AppSettings(BaseSettings):
         validation_alias=AliasChoices("BULLETIN_SCRAPER_STRATEGIES"),
     )
     default_input_modes: str = Field(
-        default="images,text,pdf",
+        default="images,text,text-images",
         validation_alias=AliasChoices("BULLETIN_SCRAPER_INPUT_MODES"),
     )
     workers: int = Field(default=4, ge=1, validation_alias=AliasChoices("BULLETIN_SCRAPER_WORKERS"))
@@ -73,6 +73,14 @@ class AppSettings(BaseSettings):
         default="bulletin-scraper",
         validation_alias=AliasChoices("OPENROUTER_APP_NAME", "BULLETIN_SCRAPER_OPENROUTER_APP_NAME"),
     )
+    enable_prompt_caching: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("BULLETIN_SCRAPER_ENABLE_PROMPT_CACHING"),
+    )
+    prompt_cache_ttl: Literal["5m", "1h"] = Field(
+        default="5m",
+        validation_alias=AliasChoices("BULLETIN_SCRAPER_PROMPT_CACHE_TTL"),
+    )
 
 
 @lru_cache(maxsize=1)
@@ -96,7 +104,9 @@ class RunConfig(StrictModel):
     strategies: list[StrategyKind] = Field(
         default_factory=lambda: [StrategyKind.DIRECT, StrategyKind.EXTRACT_MERGE, StrategyKind.REVIEWED]
     )
-    input_modes: list[InputMode] = Field(default_factory=lambda: [InputMode.IMAGES, InputMode.TEXT, InputMode.PDF])
+    input_modes: list[InputMode] = Field(
+        default_factory=lambda: [InputMode.IMAGES, InputMode.TEXT, InputMode.TEXT_IMAGES]
+    )
     apply_changes: bool = False
     workers: int = Field(default=4, ge=1)
     family_limit: int | None = Field(default=None, ge=1)
