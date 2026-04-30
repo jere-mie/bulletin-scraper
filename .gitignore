@@ -3,9 +3,8 @@ bulletins/
 *.pdf
 bulletins_analysis.md
 events_analysis.md
+intentions_analysis.md
 *PLAN*.md
-results.md
-
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

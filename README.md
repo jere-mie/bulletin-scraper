@@ -50,7 +50,7 @@ python app.py
 
 ## Usage
 
-The scraper supports two modes: **mass** (default) for analyzing Mass times, and **events** for extracting parish events.
+The scraper supports three modes: **mass** (default) for analyzing Mass times, **events** for extracting parish events, and **intentions** for extracting Mass intentions listed in bulletins.
 
 ### Mass Analysis Mode
 
@@ -81,8 +81,21 @@ python app.py --mode events --modify-json
 python app.py --mode events --events-path ../public/events.json --modify-json
 ```
 
+### Intentions Extraction Mode
+
+```bash
+# Extract Mass intentions from bulletins (generates a markdown report)
+python app.py --mode intentions
+
+# Extract intentions and save to `public/intentions.json`
+python app.py --mode intentions --modify-json
+
+# Specify custom intentions.json path
+python app.py --mode intentions --intentions-path ../public/intentions.json --modify-json
+```
+
 **Options:**
-- `--mode` - `mass` (default) or `events`
+- `--mode` - `mass` (default), `events`, or `intentions`
 - `--log-level` - DEBUG, INFO (default), WARNING, ERROR
 - `--workers` - Parallel workers (default: 10)
 - `--output` - Output file (default: bulletins_analysis.md for mass, events_analysis.md for events)

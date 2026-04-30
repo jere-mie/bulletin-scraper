@@ -658,3 +658,222 @@ def _extract_events_pdf(pdf_path, prompt, model_to_use, church_names):
     except Exception as e:
         logger.error(f"PDF events extraction failed for {church_names}: {str(e)[:100]}")
         return None
+
+
+def extract_intentions_from_bulletin(pdf_path, churches_data, model=None, use_images=True):
+    """
+    Extract Mass intentions from a bulletin PDF using LLM.
+    
+    Mass intentions are prayer requests listed in the bulletin for specific Masses.
+    For example, a bulletin might list:
+      "Tuesday, March 17 – 9:00 AM – Bob Joe, by John Doe"
+      "Sunday, March 22 – 11:00 AM – All holy souls in purgatory"
+    
+    Args:
+        pdf_path: Path to the bulletin PDF file
+        churches_data: List of church dicts that share this bulletin (with id, name, masses, daily_masses)
+        model: Optional model to use (overrides PREFERRED_MODEL)
+        use_images: If True, convert PDF to images for analysis
+    
+    Returns:
+        List of intention dicts extracted from the bulletin, or None on error.
+        Each dict has: church_id, date, time, intentions (array of {for, by}).
+    """
+    from datetime import datetime
+    
+    if not os.path.exists(pdf_path):
+        logger.error(f"PDF not found: {pdf_path}")
+        return None
+    
+    model_to_use = model if model else PREFERRED_MODEL
+    
+    church_names = ', '.join([c.get('name', 'Unknown') for c in churches_data])
+    
+    try:
+        current_date = datetime.now().strftime('%Y-%m-%d')
+        
+        prompt = f"""You are extracting MASS INTENTIONS from a Catholic parish bulletin.
+
+Mass intentions are specific prayer requests that are offered during a particular Mass.
+They are typically listed in the bulletin under headings like "Mass Intentions", "This Week's Intentions",
+"Liturgical Schedule", or within the weekly Mass schedule. They often appear in a format like:
+  "Tuesday, March 17 – 9:00 AM – †Bob Smith, by John Doe"
+  "Sunday 11:00 AM – For all parishioners"
+  "Wednesday 9:00 AM – In memory of Jane Doe, requested by the Smith Family"
+  "Saturday 5:00 PM – All holy souls in purgatory, especially deceased members"
+
+The "†" symbol (cross/dagger) before a name indicates someone who is deceased.
+
+CHURCHES IN THIS BULLETIN:
+{json.dumps(churches_data, indent=2)}
+
+CURRENT DATE: {current_date}
+
+TASK: Extract ALL Mass intentions listed in the bulletin. For each Mass that has intentions listed,
+create an entry with the church, date, time, and all intentions for that Mass.
+
+OUTPUT FORMAT (JSON array):
+[
+  {{
+    "church_id": "church-slug-id",
+    "date": "YYYY-MM-DD",
+    "time": "HHMM",
+    "intentions": [
+      {{
+        "for": "The person or cause the intention is for (e.g., 'Bob Smith' or 'All holy souls in purgatory')",
+        "by": "The person or family who requested the intention, or null if not specified"
+      }}
+    ]
+  }}
+]
+
+RULES:
+- Extract EVERY Mass intention listed, including daily Masses and weekend Masses
+- "for" field: The person, group, or cause that the Mass is being offered for. Include the † symbol if present.
+- "by" field: The person or family who requested/offered the intention. Set to null if not specified.
+- If a Mass has multiple intentions, list them all in the intentions array
+- Convert all dates to YYYY-MM-DD format. If the year is not specified, assume the current year ({datetime.now().year}). If the date has already passed this year, assume next year.
+- Convert all times to 24-hour HHMM format (e.g., 5:00 PM -> 1700, 9:00 AM -> 0900)
+- Use the church_id from the CHURCHES list above. If multiple churches share this bulletin, match each Mass to the correct church based on the schedule or context.
+- If you cannot determine which specific church a Mass belongs to, use the first church's id.
+- Return empty array [] if no Mass intentions are found in the bulletin
+- Return ONLY valid JSON array, no explanations or markdown
+- Do NOT confuse "Mass intentions" with general prayer requests / "prayers of the faithful" / intercessions — only extract specific named intentions tied to a specific Mass date and time"""
+
+        if use_images:
+            images = convert_pdf_to_images(pdf_path, max_pages=8)
+            
+            if not images:
+                logger.warning(f"Failed to convert PDF to images, falling back to PDF mode: {pdf_path}")
+                return _extract_intentions_pdf(pdf_path, prompt, model_to_use, church_names)
+            
+            logger.info(f"Extracting intentions from {len(images)} page images for: {church_names}")
+            
+            content = _build_image_content(images, prompt)
+            
+            payload = {
+                'model': model_to_use,
+                'messages': [{'role': 'user', 'content': content}],
+                'reasoning': {
+                    'max_tokens': 5000,
+                    'exclude': True,
+                    'enabled': True
+                }
+            }
+        else:
+            return _extract_intentions_pdf(pdf_path, prompt, model_to_use, church_names)
+        
+        headers = {
+            'Authorization': f'Bearer {OPENROUTER_API_KEY}',
+            'Content-Type': 'application/json'
+        }
+        
+        result = _make_api_request(OPENROUTER_API_URL, headers, payload, 180, church_names)
+        
+        if result is None:
+            return None
+        
+        if 'choices' in result and len(result['choices']) > 0:
+            content = result['choices'][0]['message']['content'].strip()
+            
+            logger.debug(f"LLM Intentions Raw Response:\n{content}")
+            
+            import re
+            json_match = re.search(r'\[.*\]', content, re.DOTALL)
+            
+            if json_match:
+                json_str = json_match.group(0)
+                intentions_list = json.loads(json_str)
+                total_intentions = sum(len(m.get('intentions', [])) for m in intentions_list)
+                logger.info(f"✓ Extracted {len(intentions_list)} Masses with {total_intentions} intentions for: {church_names}")
+                return intentions_list
+            elif content.strip() == '[]':
+                logger.info(f"✓ No intentions found for: {church_names}")
+                return []
+            else:
+                logger.warning(f"Could not parse intentions JSON for: {church_names}")
+                logger.debug(f"Response content: {content[:500]}")
+                return []
+        else:
+            logger.error(f"No response from LLM for intentions extraction: {church_names}")
+            return None
+    
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse intentions JSON for {church_names}: {str(e)[:100]}")
+        return []
+    except Exception as e:
+        logger.error(f"Error extracting intentions for {church_names}: {str(e)[:100]}")
+        return None
+
+
+def _extract_intentions_pdf(pdf_path, prompt, model_to_use, church_names):
+    """
+    Legacy PDF-based intentions extraction (fallback when image conversion fails).
+    """
+    try:
+        with open(pdf_path, 'rb') as f:
+            pdf_base64 = base64.b64encode(f.read()).decode('utf-8')
+        
+        data_url = f"data:application/pdf;base64,{pdf_base64}"
+        
+        logger.info(f"Extracting intentions from PDF (fallback mode) for: {church_names}")
+        
+        headers = {
+            'Authorization': f'Bearer {OPENROUTER_API_KEY}',
+            'Content-Type': 'application/json'
+        }
+        
+        payload = {
+            'model': model_to_use,
+            'messages': [
+                {
+                    'role': 'user',
+                    'content': [
+                        {'type': 'text', 'text': prompt},
+                        {
+                            'type': 'file',
+                            'file': {
+                                'filename': 'bulletin.pdf',
+                                'file_data': data_url
+                            }
+                        }
+                    ]
+                }
+            ],
+            'reasoning': {
+                'max_tokens': 5000,
+                'exclude': True,
+                'enabled': True
+            }
+        }
+        
+        result = _make_api_request(OPENROUTER_API_URL, headers, payload, 120, church_names)
+        
+        if result is None:
+            return None
+        
+        if 'choices' in result and len(result['choices']) > 0:
+            content = result['choices'][0]['message']['content'].strip()
+            
+            import re
+            json_match = re.search(r'\[.*\]', content, re.DOTALL)
+            
+            if json_match:
+                json_str = json_match.group(0)
+                intentions_list = json.loads(json_str)
+                total_intentions = sum(len(m.get('intentions', [])) for m in intentions_list)
+                logger.info(f"✓ Extracted {len(intentions_list)} Masses with {total_intentions} intentions for: {church_names}")
+                return intentions_list
+            elif content.strip() == '[]':
+                logger.info(f"✓ No intentions found for: {church_names}")
+                return []
+            else:
+                logger.warning(f"Could not parse intentions JSON for: {church_names}")
+                return []
+        else:
+            logger.error(f"No response from LLM for intentions extraction: {church_names}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"PDF intentions extraction failed for {church_names}: {str(e)[:100]}")
+        return None

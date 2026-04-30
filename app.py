@@ -2,7 +2,14 @@
 """
 Main entrypoint for the bulletin analysis application.
 Orchestrates scraping, PDF processing, and LLM analysis.
-Supports two modes: 'mass' (update mass times) and 'events' (extract events).
+Supports three modes:
+ - 'mass'       : update Mass times
+ - 'events'     : extract parish events
+ - 'intentions' : extract Mass intentions
+When the --output argument is not provided, the default output filenames are:
+ - mass mode       -> bulletins_analysis.md
+ - events mode     -> events_analysis.md
+ - intentions mode -> intentions_analysis.md
 """
 
 import logging
@@ -16,7 +23,7 @@ from urllib.parse import quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Import utilities
-from utils import scraping, llm, events
+from utils import scraping, llm, events, intentions
 from utils.logging_config import setup_logging
 
 
@@ -77,6 +84,37 @@ def extract_events_task(website, pdf_link, pdf_path, churches_for_bulletin, exis
     return (website, pdf_link, extracted, church_names, family_of_parishes)
 
 
+def extract_intentions_task(website, pdf_link, pdf_path, churches_for_bulletin, model=None, use_images=True):
+    """
+    Helper function to extract Mass intentions from a single bulletin.
+    Returns (website, pdf_link, intentions_list, church_names) tuple.
+    """
+    logger = logging.getLogger(__name__)
+    
+    church_names = [c.get('name', 'Unknown') for c in churches_for_bulletin]
+    
+    # Prepare churches context for LLM (includes mass schedules for matching)
+    churches_context = intentions.prepare_churches_context(churches_for_bulletin)
+    
+    # Extract intentions from bulletin
+    extracted = llm.extract_intentions_from_bulletin(
+        pdf_path, 
+        churches_context, 
+        model=model,
+        use_images=use_images
+    )
+    
+    if extracted is None:
+        logger.warning(f"Failed to extract intentions for churches: {', '.join(church_names)}")
+        return (website, pdf_link, [], church_names)
+    
+    # Add metadata to each intention entry
+    for intention in extracted:
+        intentions.add_intention_metadata(intention, pdf_link)
+    
+    return (website, pdf_link, extracted, church_names)
+
+
 def main():
     """Main application flow"""
     parser = argparse.ArgumentParser(
@@ -85,8 +123,8 @@ def main():
     parser.add_argument(
         '--mode',
         default='mass',
-        choices=['mass', 'events'],
-        help='Scraper mode: mass (update times), events (extract events)'
+        choices=['mass', 'events', 'intentions'],
+        help='Scraper mode: mass (update times), events (extract events), intentions (extract Mass intentions)'
     )
     parser.add_argument(
         '--log-level',
@@ -108,6 +146,11 @@ def main():
         '--events-path',
         default='../public/events.json',
         help='Path to events.json (default: ../public/events.json)'
+    )
+    parser.add_argument(
+        '--intentions-path',
+        default='../public/intentions.json',
+        help='Path to intentions.json (default: ../public/intentions.json)'
     )
     parser.add_argument(
         '--workers',
@@ -149,13 +192,19 @@ def main():
     script_dir = Path(__file__).parent
     churches_path = script_dir / args.churches_path
     events_path = script_dir / args.events_path
+    intentions_path = script_dir / args.intentions_path
     bulletins_dir = script_dir / 'bulletins'
     
     # Set default output path based on mode
     if args.output:
         output_path = script_dir / args.output
     else:
-        output_path = script_dir / ('events_analysis.md' if args.mode == 'events' else 'bulletins_analysis.md')
+        default_outputs = {
+            'mass': 'bulletins_analysis.md',
+            'events': 'events_analysis.md',
+            'intentions': 'intentions_analysis.md',
+        }
+        output_path = script_dir / default_outputs[args.mode]
     
     # Verify churches.json exists
     if not churches_path.exists():
@@ -194,6 +243,8 @@ def main():
     # Branch based on mode
     if args.mode == 'events':
         return run_events_mode(args, logger, churches, downloaded, events_path, output_path, use_images)
+    elif args.mode == 'intentions':
+        return run_intentions_mode(args, logger, churches, downloaded, intentions_path, output_path, use_images)
     else:
         return run_mass_mode(args, logger, churches, downloaded, churches_path, output_path, use_images)
 
@@ -381,6 +432,146 @@ def run_events_mode(args, logger, churches, downloaded, events_path, output_path
     logger.info(f"Total events after merge: {len(merged_events)}")
     
     return 0
+
+
+def run_intentions_mode(args, logger, churches, downloaded, intentions_path, output_path, use_images=True):
+    """Run the Mass intentions extraction mode."""
+    
+    # Load existing intentions for merging
+    existing_intentions = intentions.load_intentions_json(str(intentions_path))
+    
+    # Extract intentions from each bulletin in parallel
+    logger.info(f"Extracting Mass intentions from {len(downloaded)} bulletin(s) with LLM (using {args.workers} workers)...")
+    all_extracted_intentions = []
+    intentions_results = []  # For report generation
+    
+    # Prepare extraction tasks
+    tasks = []
+    # Diagnostic: log downloaded websites and how many churches match each
+    logger.debug(f"Downloaded bulletin websites: {[w for w, _, _ in downloaded][:10]}")
+    for website, pdf_link, pdf_path in downloaded:
+        churches_for_bulletin = [
+            c for c in churches 
+            if c.get('bulletin_website') == website
+        ]
+        logger.debug(f"Website {website} -> matched {len(churches_for_bulletin)} church(es)")
+        
+        if not churches_for_bulletin:
+            logger.warning(f"No church found for website {website}, skipping")
+            continue
+        
+        tasks.append((website, pdf_link, pdf_path, churches_for_bulletin))
+    
+    # Execute extraction tasks in parallel
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        futures = {
+            executor.submit(
+                extract_intentions_task, 
+                website, pdf_link, pdf_path, churches_for_bulletin, 
+                model=args.model, use_images=use_images
+            ): (website, pdf_link, churches_for_bulletin)
+            for website, pdf_link, pdf_path, churches_for_bulletin in tasks
+        }
+        
+        for future in as_completed(futures):
+            try:
+                website, pdf_link, extracted_intentions, church_names = future.result()
+                
+                if extracted_intentions:
+                    all_extracted_intentions.extend(extracted_intentions)
+                    intentions_results.append({
+                        'website': website,
+                        'pdf_link': pdf_link,
+                        'intentions': extracted_intentions,
+                        'church_names': church_names,
+                    })
+            except Exception as e:
+                logger.error(f"Intentions extraction task failed: {e}")
+                continue
+    
+    # Merge extracted intentions with existing
+    merged_intentions = intentions.merge_intentions(existing_intentions, all_extracted_intentions)
+    
+    # Write intentions analysis report
+    try:
+        write_intentions_report(output_path, intentions_results)
+        logger.info(f"Intentions extraction complete. Report saved to {output_path}")
+    except Exception as e:
+        logger.error(f"Failed to write intentions report: {e}")
+        return 1
+    
+    # Optionally save merged intentions to intentions.json
+    if args.modify_json:
+        logger.info("--modify-json flag set. Saving intentions to intentions.json...")
+        try:
+            intentions.save_intentions_json(merged_intentions, str(intentions_path))
+            logger.info(f"✓ intentions.json updated successfully: {intentions_path}")
+        except Exception as e:
+            logger.error(f"Failed to save intentions.json: {e}")
+            return 1
+    
+    # Summary
+    total_masses = len(all_extracted_intentions)
+    total_intentions = sum(len(m.get('intentions', [])) for m in all_extracted_intentions)
+    logger.info(f"Extracted {total_intentions} intentions across {total_masses} Masses from {len(intentions_results)} bulletin(s)")
+    logger.info(f"Total intention entries after merge: {len(merged_intentions)}")
+    
+    return 0
+
+
+def write_intentions_report(output_path, intentions_results):
+    """Write intentions extraction report to markdown file."""
+    logger = logging.getLogger(__name__)
+    logger.info(f"Writing intentions report to {output_path}")
+    
+    total_masses = sum(len(r['intentions']) for r in intentions_results)
+    total_intentions = sum(
+        sum(len(m.get('intentions', [])) for m in r['intentions'])
+        for r in intentions_results
+    )
+    
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write("# Mass Intentions Extraction Report\n\n")
+        f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        
+        f.write("## Summary\n\n")
+        if not intentions_results:
+            f.write("No Mass intentions found in any bulletins.\n\n")
+        else:
+            f.write(f"Extracted **{total_intentions}** intentions across **{total_masses}** Masses from **{len(intentions_results)}** bulletin(s).\n\n")
+        
+        if intentions_results:
+            f.write("## Extracted Intentions\n\n")
+            
+            for result in intentions_results:
+                pdf_link = result.get('pdf_link', result.get('website', ''))
+                church_names = result.get('church_names', [])
+                intentions_list = result.get('intentions', [])
+                
+                encoded_link = quote(pdf_link, safe=':/?#[]@!\'()*+,;=')
+                
+                f.write(f"### [Bulletin]({encoded_link})\n\n")
+                f.write(f"**Churches:** {', '.join(church_names)}\n\n")
+                
+                if not intentions_list:
+                    f.write("*No intentions found.*\n\n")
+                else:
+                    f.write("| Date | Time | Church | Intention For | Requested By |\n")
+                    f.write("|------|------|--------|---------------|-------------|\n")
+                    
+                    for mass in intentions_list:
+                        date = mass.get('date', 'N/A')
+                        time_val = mass.get('time', 'N/A')
+                        church_id = mass.get('church_id', 'N/A')
+                        
+                        for intention in mass.get('intentions', []):
+                            for_val = intention.get('for', 'N/A')
+                            by_val = intention.get('by') or 'N/A'
+                            f.write(f"| {date} | {time_val} | {church_id} | {for_val} | {by_val} |\n")
+                    
+                    f.write("\n")
+        
+        f.write("*End of report.*\n")
 
 
 def write_analysis_report(output_path, markdown_results):
