@@ -1,5 +1,6 @@
 bulletins*.txt
 bulletins/
+runs/
 *.pdf
 bulletins_analysis.md
 events_analysis.md

@@ -1,0 +1,157 @@
+name: Bulletin Scraper & Analysis
+
+on:
+  workflow_dispatch:
+    inputs:
+      create_issue:
+        description: Create a GitHub issue with the run summary
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      targets:
+        description: Targets to run
+        required: false
+        default: schedule,events,intentions
+        type: string
+      strategies:
+        description: Strategies to evaluate
+        required: false
+        default: direct,extract-merge,reviewed
+        type: string
+      input_modes:
+        description: Bulletin input modes to evaluate
+        required: false
+        default: images,text
+        type: string
+      family_filter:
+        description: Restrict the run to families whose id or name contains this value
+        required: false
+        default: ""
+        type: string
+      family_limit:
+        description: Limit the run to the first N families
+        required: false
+        default: ""
+        type: string
+      workers:
+        description: Family-level parallel worker count
+        required: false
+        default: "4"
+        type: string
+      log_level:
+        description: Logging level
+        required: false
+        default: INFO
+        type: choice
+        options:
+          - DEBUG
+          - INFO
+          - WARNING
+          - ERROR
+      use_existing_bulletins:
+        description: Force reuse of local bulletin PDFs
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      refresh_bulletins:
+        description: Ignore same-day cache entries and rescrape bulletins
+        required: false
+        default: "false"
+        type: string
+      model:
+        description: OpenRouter model to use
+        required: false
+        default: google/gemini-3.1-flash-lite-preview
+        type: string
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  scrape-and-analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Sync dependencies
+        run: uv sync --all-groups
+
+      - name: Run bulletin analysis
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OPENROUTER_MODEL: ${{ github.event.inputs.model }}
+        run: |
+          args=(
+            --targets "${{ github.event.inputs.targets }}"
+            --strategies "${{ github.event.inputs.strategies }}"
+            --input-modes "${{ github.event.inputs.input_modes }}"
+            --workers "${{ github.event.inputs.workers }}"
+            --log-level "${{ github.event.inputs.log_level }}"
+            --model "${{ github.event.inputs.model }}"
+          )
+
+          if [ -n "${{ github.event.inputs.family_filter }}" ]; then
+            args+=(--family-filter "${{ github.event.inputs.family_filter }}")
+          fi
+
+          if [ -n "${{ github.event.inputs.family_limit }}" ]; then
+            args+=(--family-limit "${{ github.event.inputs.family_limit }}")
+          fi
+
+          if [ "${{ github.event.inputs.use_existing_bulletins }}" = "true" ]; then
+            args+=(--use-existing-bulletins)
+          else
+            args+=(--no-use-existing-bulletins)
+          fi
+
+          if [ "${{ github.event.inputs.refresh_bulletins }}" = "true" ]; then
+            args+=(--refresh-bulletins)
+          else
+            args+=(--no-refresh-bulletins)
+          fi
+
+          uv run python app.py "${args[@]}"
+
+      - name: Resolve latest run directory
+        id: latest_run
+        shell: bash
+        run: |
+          latest_run=$(find runs -mindepth 1 -maxdepth 1 -type d | sort | tail -n 1)
+          if [ -z "$latest_run" ]; then
+            echo "No run directory was produced"
+            exit 1
+          fi
+          echo "path=$latest_run" >> "$GITHUB_OUTPUT"
+          cp "$latest_run/summary.md" workflow-summary.md
+
+      - name: Upload run artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bulletin-run
+          path: ${{ steps.latest_run.outputs.path }}
+
+      - name: Create GitHub Issue
+        if: github.event.inputs.create_issue == 'true'
+        uses: peter-evans/create-issue-from-file@v5
+        with:
+          title: Bulletin workflow run ${{ github.run_number }}
+          content-filepath: workflow-summary.md
+          labels: |
+            bulletin-sync
+            automated
